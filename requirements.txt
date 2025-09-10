@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 python-telegram-bot>=20.0
-bocfx
+git+https://github.com/bobleer/bocfx.git
