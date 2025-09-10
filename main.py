@@ -13,7 +13,7 @@ def _mask(s: str | None) -> str:
         return "None"
     return s[:6] + "..." + s[-4:]
 
-# 优先读 TELEGRAM_TOKEN，兜底读 TOKEN（以防你在 Railway 用了 TOKEN）
+# 优先读 TELEGRAM_TOKEN，兜底读 TOKEN
 TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
 PORT = int(os.environ.get("PORT", "8000"))
@@ -27,7 +27,7 @@ print("Loaded TOKEN(masked):", _mask(TOKEN))
 print("Loaded BASE_URL:", BASE_URL)
 print("============================")
 
-# ---- 业务：查询中行“美元现汇卖出价” ----
+# ---- 业务逻辑：中行“美元现汇卖出价” ----
 from bocfx import bocfx
 
 async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42,7 +42,7 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"查询失败：{e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！发送 /rate 获取人民币对美元的现汇卖出价。")
+    await update.message.reply_text("你好！发送 /rate 获取人民币对美元现汇卖出价。")
 
 async def cmd_debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -77,8 +77,11 @@ async def lifespan(app_fastapi: FastAPI):
     # 注册 webhook（若未提供 BASE_URL，则仅启动 bot、不注册 webhook）
     if BASE_URL:
         webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{TOKEN}"
-        await ptb_app.bot.set_webhook(webhook_url)
-        print("Webhook 已设置:", webhook_url)
+        try:
+            await ptb_app.bot.set_webhook(webhook_url)
+            print("Webhook 已设置:", webhook_url)
+        except Exception as e:
+            print("Webhook 设置失败：", e)
     else:
         print("警告：未设置 BASE_URL，未注册 webhook（/webhook/<TOKEN>）。")
 
@@ -106,4 +109,14 @@ async def health():
 @app.get("/__env")
 async def env_probe():
     return {
-        "TELEGRAM_TOKEN_in_env":_
+        "TELEGRAM_TOKEN_in_env": "TELEGRAM_TOKEN" in os.environ,
+        "TOKEN_in_env": "TOKEN" in os.environ,
+        "BASE_URL_in_env": "BASE_URL" in os.environ,
+        "PORT": PORT,
+        "TOKEN_masked": _mask(TOKEN),
+        "BASE_URL": BASE_URL or None,
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
