@@ -1,3 +1,16 @@
+import os
+print("=== DEBUG: ALL ENV VARS ===")
+for k, v in os.environ.items():
+    print(f"{k}={v}")
+print("=== END DEBUG ===")
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BASE_URL = os.environ.get("BASE_URL")
+PORT = int(os.environ.get("PORT", "8000"))
+
+print("DEBUG TELEGRAM_TOKEN:", TOKEN)
+print("DEBUG BASE_URL:", BASE_URL)
+
 # main.py
 import os
 from contextlib import asynccontextmanager
