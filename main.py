@@ -24,22 +24,84 @@ print("BASE_URL set?:", bool(BASE_URL))
 print("PORT:", PORT)
 print("================")
 
-# ---------- 业务逻辑：中行“美元现汇卖出价”（bocfx 返回单位：每100 USD） ----------
+# ---- 业务逻辑：中行“美元现汇卖出价”（bocfx 返回单位：每100 USD）----
 from bocfx import bocfx
+
+def _try_pick_number(x):
+    """从 bocfx 返回的数据结构里尽力取出一个数字（字符串或数字都可）"""
+    if x is None:
+        return None
+    # 直接就是数字或可转浮点的字符串
+    try:
+        return float(str(x))
+    except Exception:
+        pass
+    # 列表/元组：找第一个可转浮点的元素
+    if isinstance(x, (list, tuple)):
+        for item in x:
+            try:
+                return float(str(item))
+            except Exception:
+                continue
+        return None
+    # 字典：尝试常见 key
+    if isinstance(x, dict):
+        candidate_keys = ["SE,ASK", "SE_ASK", "SE ASK", "SEASK", "SE-ASK"]
+        for k in candidate_keys:
+            v = x.get(k)
+            try:
+                return float(str(v))
+            except Exception:
+                continue
+        # 再兜底遍历所有值
+        for v in x.values():
+            try:
+                return float(str(v))
+            except Exception:
+                continue
+    return None
 
 async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        result = bocfx("USD", "SE,ASK")  # 现汇 卖出
-        if not result:
-            await update.message.reply_text("未获取到汇率数据。")
+        # 依次尝试几种最常见/最合理的调用方式
+        attempts = [
+            ("USD", "SE,ASK"),      # 首选：现汇 卖出
+            ("USD,CNY", "SE,ASK"),  # 有些版本需要显式给出两个币种
+            ("USD", None),          # 不传 sort（bocfx 可能返回全部四种）
+        ]
+        raw = None
+        last_err = None
+
+        for farg, sarg in attempts:
+            try:
+                res = bocfx(farg, sarg) if sarg else bocfx(farg)
+                raw = _try_pick_number(res)
+                if raw is not None:
+                    break
+            except SystemExit:
+                # bocfx 内部对参数不合法会 exit，这里吞掉继续尝试下一种
+                last_err = "bocfx SystemExit"
+                continue
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        if raw is None:
+            msg = "未获取到汇率数据。"
+            if last_err:
+                msg += f"（{last_err}）"
+            await update.message.reply_text(msg)
             return
-        raw = float(str(result[0]))      # CNY / 100 USD
-        per_usd = raw / 100.0            # CNY / 1 USD
+
+        # bocfx/中行单位为每 100 USD 的人民币价 → 换算为“每 1 USD”
+        per_usd = raw / 100.0
         await update.message.reply_text(
             f"人民币对美元现汇卖出价：{per_usd:.6f} CNY / 1 USD（牌价：{raw} CNY / 100 USD）"
         )
+
     except SystemExit:
-        await update.message.reply_text("bocfx 参数异常（已使用 sort='SE,ASK'）。请稍后再试。")
+        # 再兜底一次，避免把进程干掉
+        await update.message.reply_text("bocfx 参数异常（已做兼容重试），请稍后再试。")
     except Exception as e:
         await update.message.reply_text(f"查询失败：{e}")
 
