@@ -1,16 +1,5 @@
 # main.py
 import os
-print("=== DEBUG: ALL ENV VARS ===")
-for k, v in os.environ.items():
-    print(f"{k}={v}")
-print("=== END DEBUG ===")
-
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")
-PORT = int(os.environ.get("PORT", "8000"))
-
-print("DEBUG TELEGRAM_TOKEN:", TOKEN)
-print("DEBUG BASE_URL:", BASE_URL)
 
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -26,6 +15,14 @@ from bocfx import bocfx
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
 PORT = int(os.environ.get("PORT", "8000"))
+
+print("=== DEBUG: ALL ENV VARS ===")
+for k, v in os.environ.items():
+    print(f"{k}={v}")
+print("=== END DEBUG ===")
+
+print("DEBUG TELEGRAM_TOKEN:", TOKEN)
+print("DEBUG BASE_URL:", BASE_URL)
 
 if not TOKEN:
     raise RuntimeError("请设置 TELEGRAM_TOKEN 环境变量")
