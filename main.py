@@ -1,3 +1,4 @@
+# main.py
 import os
 print("=== DEBUG: ALL ENV VARS ===")
 for k, v in os.environ.items():
@@ -11,8 +12,6 @@ PORT = int(os.environ.get("PORT", "8000"))
 print("DEBUG TELEGRAM_TOKEN:", TOKEN)
 print("DEBUG BASE_URL:", BASE_URL)
 
-# main.py
-import os
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 
