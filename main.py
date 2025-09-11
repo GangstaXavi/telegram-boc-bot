@@ -95,6 +95,62 @@ def _parse_amount_to_decimal(text: str) -> Decimal | None:
     except InvalidOperation:
         return None
 
+# —— 新增：把带中文单位的金额转成 Decimal（支持：亿/万/千/百/十，支持链式：1万2千3百）——
+def _parse_amount_chinese(text: str) -> Decimal | None:
+    """
+    支持形式：
+      - 50万 -> 500000
+      - 3.5万 -> 35000
+      - 2亿 -> 200000000
+      - 1万2千 -> 12000
+      - 1万2千3百50 -> 12350
+    仅支持阿拉伯数字 + 单位（亿/万/千/百/十）的组合；不解析汉字数字（如“五十万”）。
+    """
+    import re
+    if not text:
+        return None
+    # 保留数字、点、逗号和单位字符，其余删除（去掉“美元/美金/USD”等）
+    cleaned = re.sub(r"[^0-9\.\,亿万千百十]", "", text)
+    if not cleaned:
+        return None
+
+    # 先尝试纯数字直接转（避免“500000”这类被误判）
+    try:
+        pure = cleaned.replace(",", "")
+        if re.fullmatch(r"\d+(?:\.\d+)?", pure):
+            val = Decimal(pure)
+            return val if Decimal("0") < val <= Decimal("1000000000") else None
+    except Exception:
+        pass
+
+    # 解析带单位的片段并求和
+    unit_map = {"亿": Decimal("100000000"), "万": Decimal("10000"),
+                "千": Decimal("1000"), "百": Decimal("100"), "十": Decimal("10"), "": Decimal("1")}
+    # 匹配若干个 “数字 + 可选单位” 片段
+    parts = re.findall(r"(\d+(?:\.\d+)?)([亿万千百十]?)", cleaned)
+    if not parts:
+        return None
+
+    total = Decimal("0")
+    try:
+        for num_str, unit in parts:
+            num = Decimal(num_str)
+            total += num * unit_map.get(unit, Decimal("1"))
+    except Exception:
+        return None
+
+    # 边界保护
+    if total <= 0 or total > Decimal("1000000000"):
+        return None
+    return total.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+def _parse_amount_any(text: str) -> Decimal | None:
+    """先按纯数字解析，失败再按中文单位解析"""
+    val = _parse_amount_to_decimal(text)
+    if val is not None:
+        return val
+    return _parse_amount_chinese(text)
+
 def _parse_percent_to_decimal(text: str) -> Decimal | None:
     try:
         t = text.replace("%", "").strip()
@@ -260,19 +316,24 @@ async def cmd_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alias_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    中文别名：匹配 “兑换 <金额>”
+    中文别名：匹配 “兑换 <金额>”，金额可为：
+      - 纯数字：500000 / 12345.67
+      - 带中文单位：50万 / 3.5万 / 2亿 / 1万2千 等
     """
-    text = (update.message.text or "").strip()
-    # 允许 “兑换 500000” 或 “兑换500000”
     import re
-    m = re.match(r"^兑换\s*([\d,]+(?:\.\d+)?)\s*$", text)
+    text = (update.message.text or "").strip()
+    # 捕获“兑换”后的全部内容，交给解析器处理
+    m = re.match(r"^兑换\s*(.+?)\s*$", text)
     if not m:
-        await update.message.reply_text("用法：兑换 金额（单位：美金）。例如：兑换 500000")
+        await update.message.reply_text("用法：兑换 金额（单位：美金）。例如：兑换 500000 / 兑换 50万")
         return
-    amt = _parse_amount_to_decimal(m.group(1))
+    token = m.group(1)
+
+    amt = _parse_amount_any(token)
     if amt is None:
-        await update.message.reply_text("请输入合法的金额（仅数字，最大 1e9）。例如：兑换 500000")
+        await update.message.reply_text("请输入合法的金额，例如：兑换 500000 或 兑换 50万")
         return
+
     await start_convert_flow(update, context, amt)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,7 +434,7 @@ async def lifespan(app_fastapi: FastAPI):
 
     # /convert + 中文“兑换”
     ptb_app.add_handler(CommandHandler("convert", cmd_convert))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^兑换\s*[\d,]+(?:\.\d+)?\s*$"), alias_convert))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^兑换\s*\S+.*$"), alias_convert))
 
     # 费率输入/取消/沿用的自由文本
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
