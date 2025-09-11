@@ -68,7 +68,7 @@ async def fetch_boc_official_usd_se_ask_httpx():
 
         # === 打印调试信息 ===
         print("=== DEBUG BOC HTML START ===")
-        print(r.text[:1000])  # 打印前1000字符
+        print(r.text[:8000])  # 打印前8000字符
         print("=== DEBUG BOC HTML END ===")
 
         soup = BeautifulSoup(r.text, "lxml")
