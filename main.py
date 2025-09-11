@@ -39,8 +39,10 @@ print("================")
 BOC_URL = "https://www.boc.cn/sourcedb/whpj/"
 RATE_TTL = 120  # 秒
 PENDING_TTL = 120  # 秒，等待费率输入超时
+# 缓存：per_usd(Decimal, 每1USD)、pub_time(str|None)、raw_100(Decimal, 每100USD)
 _rate_cache = {"per_usd": None, "pub_time": None, "cached_at": None, "raw_100": None}
-pending_fee = {}  # chat_id -> {"amount_usd": Decimal, "created_at": datetime, "last_fee": Decimal|None}
+# 待费率会话 & 费率记忆
+pending_fee = {}   # chat_id -> {"amount_usd": Decimal, "created_at": datetime, "last_fee": Decimal|None}
 last_fee_mem = {}  # chat_id -> Decimal
 
 # ---------- 工具函数 ----------
@@ -73,7 +75,8 @@ def _first_number_deep(x):
                 return w
     return None
 
-def _fmt_money(d: Decimal, places: int = 6) -> str:
+def _fmt_money(d: Decimal, places: int = 4) -> str:
+    """金额/汇率统一保留4位小数，带千分位"""
     q = Decimal(10) ** -places
     v = d.quantize(q, rounding=ROUND_HALF_UP)
     return f"{v:,.{places}f}"
@@ -86,7 +89,6 @@ def _parse_amount_to_decimal(text: str) -> Decimal | None:
         val = Decimal(t)
         if val <= 0:
             return None
-        # 限制最大值，防止误输入
         if val > Decimal("1000000000"):
             return None
         return val
@@ -111,7 +113,7 @@ def _now_tz():
 async def fetch_boc_official_usd_se_ask_httpx():
     """
     抓取中国银行官网“美元 现汇卖出价”
-    返回： (per_usd(Decimal), pub_time_str(str|None), raw_100(Decimal)) 或 (None, None, None)
+    返回： (per_usd(Decimal), pub_time(str|None), raw_100(Decimal)) 或 (None, None, None)
     """
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -125,7 +127,6 @@ async def fetch_boc_official_usd_se_ask_httpx():
             r = await client.get(BOC_URL)
         text = r.text
         if not text or "<table" not in text:
-            # 某些场景页面编码声明缺失，回退 gb18030
             r.encoding = "gb18030"
             text = r.text
 
@@ -139,7 +140,6 @@ async def fetch_boc_official_usd_se_ask_httpx():
             if not ths:
                 continue
 
-            # 找列索引
             col_ask = None
             col_time = None
             for i, name in enumerate(ths):
@@ -151,13 +151,12 @@ async def fetch_boc_official_usd_se_ask_httpx():
             if col_ask is None:
                 continue
 
-            # 枚举行，找美元
             for tr in table.find_all("tr")[1:]:
                 tds = tr.find_all("td")
                 if not tds:
                     continue
                 cc_name = tds[0].get_text(strip=True) if len(tds) > 0 else ""
-                if (cc_name and ("美元" in cc_name or "USD" in cc_name.upper())):
+                if cc_name and ("美元" in cc_name or "USD" in cc_name.upper()):
                     ask_text = tds[col_ask].get_text(strip=True) if col_ask < len(tds) else ""
                     ask_raw = _clean_number(ask_text)
                     if ask_raw is None:
@@ -175,7 +174,7 @@ async def fetch_boc_official_usd_se_ask_httpx():
 
 def fetch_bocfx_usd_se_ask():
     """
-    bocfx 兜底：返回 (per_usd(Decimal), None, raw_100(Decimal)) 或 (None,None,None)
+    bocfx 兜底：返回 (per_usd(Decimal), pub_time(None), raw_100(Decimal)) 或 (None,None,None)
     """
     attempts = [("USD", "SE,ASK"), ("USD,CNY", "SE,ASK"), ("USD", None)]
     for farg, sarg in attempts:
@@ -191,9 +190,7 @@ def fetch_bocfx_usd_se_ask():
     return None, None, None
 
 async def get_usd_per_usd_with_cache():
-    """
-    返回缓存中的 per_usd, pub_time, raw_100；若过期则刷新。
-    """
+    """返回 (per_usd, pub_time, raw_100)；若缓存过期则刷新。"""
     try:
         if _rate_cache["per_usd"] and _rate_cache["cached_at"]:
             if (_now_tz() - _rate_cache["cached_at"]).total_seconds() < RATE_TTL:
@@ -222,7 +219,7 @@ async def cmd_rate_core(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"现汇卖出价（SE,ASK）：{_fmt_money(per_usd)} CNY / 1 USD\n"
         f"牌价：{_fmt_money(raw_100)} CNY / 100 USD\n"
-        f"挂牌时间：{time_str}\n"
+        f"挂牌时间（北京时间，UTC+8）：{time_str}\n"
         f"来源：{BOC_URL}"
     )
     await update.message.reply_text(msg)
@@ -235,8 +232,22 @@ async def alias_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_rate_core(update, context)
 
 # ---------- /convert（仅美金->人民币） ----------
+async def start_convert_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: Decimal):
+    chat_id = update.effective_chat.id
+    last = last_fee_mem.get(chat_id)
+    pending_fee[chat_id] = {
+        "amount_usd": amount,
+        "created_at": _now_tz(),
+        "last_fee": last,
+    }
+    if last is not None:
+        await update.message.reply_text(
+            f"上次费率为 {last}% ，是否沿用？发送“是”直接计算，或发送新的百分比（如 2.3），发送“取消”退出。"
+        )
+    else:
+        await update.message.reply_text("请输入手续费率（百分比）。例如 2.3 表示 2.3%。发送“取消”退出。")
+
 async def cmd_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 解析金额
     args = context.args
     if not args:
         await update.message.reply_text("用法：/convert 金额（单位：美金）。例如：/convert 500000")
@@ -245,31 +256,33 @@ async def cmd_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount is None:
         await update.message.reply_text("请输入合法的金额（仅数字，最大 1e9）。例如：/convert 500000")
         return
+    await start_convert_flow(update, context, amount)
 
-    chat_id = update.effective_chat.id
-    # 记录待输入费率状态
-    last = last_fee_mem.get(chat_id)
-    pending_fee[chat_id] = {
-        "amount_usd": amount,
-        "created_at": _now_tz(),
-        "last_fee": last,  # Decimal or None
-    }
-
-    if last is not None:
-        await update.message.reply_text(
-            f"上次费率为 {last}% ，是否沿用？发送“是”直接计算，或发送新的百分比（如 2.3），发送“取消”退出。"
-        )
-    else:
-        await update.message.reply_text("请输入手续费率（百分比）。例如 2.3 表示 2.3%。发送“取消”退出。")
+async def alias_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    中文别名：匹配 “兑换 <金额>”
+    """
+    text = (update.message.text or "").strip()
+    # 允许 “兑换 500000” 或 “兑换500000”
+    import re
+    m = re.match(r"^兑换\s*([\d,]+(?:\.\d+)?)\s*$", text)
+    if not m:
+        await update.message.reply_text("用法：兑换 金额（单位：美金）。例如：兑换 500000")
+        return
+    amt = _parse_amount_to_decimal(m.group(1))
+    if amt is None:
+        await update.message.reply_text("请输入合法的金额（仅数字，最大 1e9）。例如：兑换 500000")
+        return
+    await start_convert_flow(update, context, amt)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    非命令文本：用于费率输入，也支持“汇率”别名
+    非命令文本：用于费率输入，也支持“汇率”别名（已在 alias_rate 单独处理）
     """
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
 
-    # 别名触发：汇率 / /汇率
+    # 别名触发：汇率 / /汇率（优先被 alias_rate 的 Regex 捕获，这里兜底）
     if text in {"汇率", "/汇率"}:
         await cmd_rate_core(update, context)
         return
@@ -279,23 +292,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state:
         return
 
-    # 超时检查
     if (_now_tz() - state["created_at"]).total_seconds() > PENDING_TTL:
         pending_fee.pop(chat_id, None)
         await update.message.reply_text("已超时取消。请重新发送 /convert 金额。")
         return
 
-    # 取消
     if text in {"取消", "cancel", "Cancel"}:
         pending_fee.pop(chat_id, None)
         await update.message.reply_text("已取消。")
         return
 
-    # 沿用
     if text in {"是", "Yes", "yes", "Y", "y"} and state.get("last_fee") is not None:
         fee_pct = state["last_fee"]
     else:
-        # 解析新的费率
         fee = _parse_percent_to_decimal(text)
         if fee is None:
             await update.message.reply_text("请输入合法的百分比（例如 2.3），或发送“取消”。")
@@ -303,7 +312,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fee_pct = fee
         last_fee_mem[chat_id] = fee_pct  # 记忆
 
-    # 进入计算
     amount_usd = state["amount_usd"]
     pending_fee.pop(chat_id, None)
 
@@ -313,33 +321,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     time_str = pub_time if pub_time else "未知"
+    usd = Decimal(amount_usd)
 
     # 计算（人民币以每1美元价计算）
-    usd = Decimal(amount_usd)
-    cny_no_fee = (usd * Decimal(per_usd)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    cny_no_fee = (usd * Decimal(per_usd)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
     fee_ratio = (Decimal(fee_pct) / Decimal("100"))
-    fee_cny = (cny_no_fee * fee_ratio).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    fee_usd = (fee_cny / Decimal(per_usd)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    total_cny = (cny_no_fee + fee_cny).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    total_usd = (usd + fee_usd).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    total_rate = (total_cny / usd).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    fee_cny = (cny_no_fee * fee_ratio).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    fee_usd = (fee_cny / Decimal(per_usd)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    total_cny = (cny_no_fee + fee_cny).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    total_usd = (usd + fee_usd).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    total_rate = (total_cny / usd).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
-    # A 外发复制版：仅 美金 / 人民币（最终含手续费） / 汇率信息（不提手续费）
+    # A 外发复制版：仅 美金 / 人民币（最终含手续费） / 简洁汇率数字 + 时间 + 来源
     msg_a = (
         f"美金：{_fmt_money(usd)} 美元\n"
         f"人民币：{_fmt_money(total_cny)} 元\n"
-        f"（使用汇率：{_fmt_money(Decimal(per_usd))} CNY / 1 USD；挂牌时间：{time_str}；来源：{BOC_URL}）"
+        f"使用汇率：{_fmt_money(Decimal(per_usd))}\n"
+        f"挂牌时间（北京时间，UTC+8）：{time_str}\n"
+        f"来源：{BOC_URL}"
     )
     await update.message.reply_text(msg_a)
 
-    # B 明细版：自用
+    # B 明细版：自用（保持完整细目 + 总额换算汇率）
     msg_b = (
         f"美金：{_fmt_money(usd)} 美元\n"
         f"人民币：{_fmt_money(cny_no_fee)} 元（不含手续费）\n"
         f"手续费：{_fmt_money(fee_usd)} 美元 / { _fmt_money(fee_cny)} 元\n"
         f"合计：{_fmt_money(total_usd)} 美元 / { _fmt_money(total_cny)} 元\n"
-        f"使用汇率及时间：{_fmt_money(Decimal(per_usd))} CNY / 1 USD（挂牌时间：{time_str}，来源：{BOC_URL}）\n"
-        f"总额换算汇率：{_fmt_money(total_rate)} CNY / 1 USD"
+        f"使用汇率及时间：{_fmt_money(Decimal(per_usd))}（挂牌时间：{time_str}，来源：{BOC_URL}）\n"
+        f"总额换算汇率：{_fmt_money(total_rate)}"
     )
     await update.message.reply_text(msg_b)
 
@@ -361,9 +371,11 @@ async def lifespan(app_fastapi: FastAPI):
     ptb_app.add_handler(CommandHandler("rate", cmd_rate))
     ptb_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/?\s*汇率\s*$"), alias_rate))
 
-    # /convert + 待费率输入的文本处理
+    # /convert + 中文“兑换”
     ptb_app.add_handler(CommandHandler("convert", cmd_convert))
-    # 非命令文本（处理费率输入／取消／沿用）
+    ptb_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^兑换\s*[\d,]+(?:\.\d+)?\s*$"), alias_convert))
+
+    # 费率输入/取消/沿用的自由文本
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if BASE_URL:
